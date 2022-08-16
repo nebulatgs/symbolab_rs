@@ -12,7 +12,7 @@ use std::{
     },
 };
 use tokio::sync::{mpsc, oneshot, RwLock};
-use tower_http::trace::TraceLayer;
+use tower_http::{compression::CompressionLayer, trace::TraceLayer};
 use tracing::{error, info, instrument, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -54,6 +54,7 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", post(handler))
         .layer(TraceLayer::new_for_http())
+        .layer(CompressionLayer::new())
         .layer(Extension(State {
             client,
             token_channel: tx,
@@ -201,9 +202,45 @@ struct Payload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SymbolabSvg {
+    canonical_notebook_query: Option<String>,
+    standard_query: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Solution {
+    step_input: Option<String>,
+    entire_result: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Data {
     symbolab: SymbolabResponse,
     cached: bool,
+    canonical_notebook_query: Option<String>,
+    standard_query: Option<String>,
+    solutions: Vec<Solution>,
+}
+
+async fn get_svg(client: &Client, latex: Option<&str>) -> anyhow::Result<Option<String>> {
+    if let Some(latex) = latex {
+        let cleaned = latex.replace('…', r#"\ldots "#).replace('π', r#"\pi "#);
+        let url = String::from_iter([
+            "https://latex.codecogs.com/svg.image?",
+            r#"\fg_343739\dpi{1000}"#,
+            &cleaned,
+        ]);
+
+        let res = client.get(url).send().await?;
+        dbg!(&res);
+        let svg = res.text().await?;
+        Ok(Some(svg))
+    } else {
+        Ok(None)
+    }
 }
 
 async fn handler(
@@ -219,8 +256,68 @@ async fn handler(
 
     let token = get_cached_token(&state).await?;
     let symbolab = get_symbolab(&state, &token, &payload).await?;
+    let queries_handle = {
+        let client = state.client.clone();
+        let canonical_notebook_query = symbolab.canonical_notebook_query.clone();
+        let standard_query = symbolab.standard_query.clone();
+        tokio::spawn(async move {
+            tokio::try_join!(
+                get_svg(&client, canonical_notebook_query.as_deref()),
+                get_svg(&client, standard_query.as_deref())
+            )
+        })
+    };
+    let handles = symbolab
+        .solutions
+        .iter()
+        .flatten()
+        .map(|solution| {
+            let client = state.client.clone();
+            let step_input = solution.step_input.clone();
+            let entire_result = solution.entire_result.clone();
+            tokio::spawn(async move {
+                let (step_input, entire_result) = tokio::try_join!(
+                    get_svg(&client, step_input.as_deref()),
+                    get_svg(&client, entire_result.as_deref())
+                )?;
+                Ok::<_, anyhow::Error>(Solution {
+                    step_input,
+                    entire_result,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut solutions = Vec::with_capacity(handles.len());
+    for handle in handles {
+        let solution = handle.await.context("failed to fetch solution")??;
+        solutions.push(solution);
+    }
+
+    let (canonical_notebook_query, standard_query) =
+        queries_handle.await.context("failed to fetch queries")??;
+    // let (canonical_notebook_query, standard_query) = {
+    //     let canonical_notebook_query = {
+    //         let client = state.client.clone();
+    //         let q = symbolab.canonical_notebook_query.as_deref();
+    //         tokio::spawn(async move { get_svg(&client, q).await })
+    //     };
+    //     let standard_query = {
+    //         let client = state.client.clone();
+    //         let q = symbolab.standard_query.as_deref();
+    //         tokio::spawn(async move { get_svg(&client, q).await })
+    //     };
+
+    //     tokio::join!(canonical_notebook_query, standard_query)
+    // };
+    // let canonical_notebook_query =
+    //     (|| -> anyhow::Result<Option<String>> { Ok(canonical_notebook_query??) })()?;
+    // let standard_query = (|| -> anyhow::Result<Option<String>> { Ok(standard_query??) })()?;
+
     let data = Data {
         symbolab,
+        canonical_notebook_query,
+        standard_query,
+        solutions,
         cached: false,
     };
 
