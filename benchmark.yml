@@ -1,0 +1,14 @@
+---
+concurrency: 256
+base: "https://symbolab-rs.fly.dev"
+iterations: 50000
+rampup: 2
+
+plan:
+  - name: Stress cache
+    request:
+      url: /
+      method: POST
+      body: '{"query": "lim_{x \\to \\infty} sin(x)/x"}'
+      headers:
+        Content-Type: "application/json"

@@ -11,8 +11,13 @@ use std::{
         Arc,
     },
 };
+use tiny_skia::Color;
 use tokio::sync::{mpsc, oneshot, RwLock};
-use tower_http::{compression::CompressionLayer, trace::TraceLayer};
+use tower_http::{
+    compression::CompressionLayer,
+    cors::{Any, CorsLayer},
+    trace::TraceLayer,
+};
 use tracing::{error, info, instrument, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -22,9 +27,13 @@ use error::*;
 mod symbolab;
 use symbolab::*;
 
+mod tex;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // console_subscriber::init();
     tracing_subscriber::registry()
+        // .with(console_subscriber::spawn())
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG")
                 .unwrap_or_else(|_| "symbolab_rs=debug,tower_http=debug".into()),
@@ -53,18 +62,27 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/", post(handler))
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            CorsLayer::new()
+                .allow_methods(Any)
+                .allow_origin(Any)
+                .allow_headers(Any),
+        )
         .layer(CompressionLayer::new())
+        .layer(TraceLayer::new_for_http())
         .layer(Extension(State {
             client,
             token_channel: tx,
             response_cache: Arc::new(RwLock::new(HashMap::new())),
         }));
 
-    let addr = SocketAddr::from((
-        [0, 0, 0, 0],
-        env::var("PORT").unwrap_or("8080".to_owned()).parse()?,
-    ));
+    // let addr = SocketAddr::from((
+    //     [0, 0, 0, 0],
+    //     env::var("PORT").unwrap_or("8080".to_owned()).parse()?,
+    // ));
+    let addr = format!("[::]:{}", env::var("PORT").unwrap_or("8080".to_owned()))
+        .parse::<std::net::SocketAddr>()?;
+
     tracing::debug!("listening on {}", addr);
     axum::Server::bind(&addr)
         .serve(app.into_make_service())
@@ -87,7 +105,14 @@ async fn token_factory(rx: &mut mpsc::Receiver<oneshot::Sender<String>>) -> anyh
         tokio::spawn(async move {
             while let Some(()) = rx_internal.recv().await {
                 queue_len.fetch_add(1, Ordering::Relaxed);
-                tx_token.send(get_token(&client).await?).await?;
+                {
+                    let tx_token = tx_token.clone();
+                    let client = client.clone();
+                    tokio::spawn(async move {
+                        tx_token.send(get_token(&client).await?).await?;
+                        Ok::<(), anyhow::Error>(())
+                    });
+                }
             }
             Ok::<(), anyhow::Error>(())
         });
@@ -199,6 +224,8 @@ async fn get_cached_token(state: &State) -> anyhow::Result<String> {
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, Hash, PartialEq)]
 struct Payload {
     query: String,
+    foreground: Option<String>,
+    background: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -211,8 +238,8 @@ struct SymbolabSvg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Solution {
-    step_input: Option<String>,
-    entire_result: Option<String>,
+    step_input: Option<ImageSet>,
+    entire_result: Option<ImageSet>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,27 +247,68 @@ struct Solution {
 struct Data {
     symbolab: SymbolabResponse,
     cached: bool,
-    canonical_notebook_query: Option<String>,
-    standard_query: Option<String>,
+    canonical_notebook_query: Option<ImageSet>,
+    standard_query: Option<ImageSet>,
     solutions: Vec<Solution>,
 }
 
-async fn get_svg(client: &Client, latex: Option<&str>) -> anyhow::Result<Option<String>> {
-    if let Some(latex) = latex {
-        let cleaned = latex.replace('…', r#"\ldots "#).replace('π', r#"\pi "#);
-        let url = String::from_iter([
-            "https://latex.codecogs.com/svg.image?",
-            r#"\fg_343739\dpi{1000}"#,
-            &cleaned,
-        ]);
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImageSet {
+    svg: Option<String>,
+    webp: Option<String>,
+}
 
-        let res = client.get(url).send().await?;
-        dbg!(&res);
-        let svg = res.text().await?;
-        Ok(Some(svg))
+fn get_image_set_sync(latex: &str, fg: &str, bg: &str) -> anyhow::Result<ImageSet> {
+    let svg = tex::get_svg(latex, fg)?;
+    let opt = usvg::Options::default();
+
+    let rtree = usvg::Tree::from_data(svg.as_bytes(), &opt.to_ref())?;
+    let pixmap_size = rtree.svg_node().size.to_screen_size();
+    let mut pixmap = tiny_skia::Pixmap::new(pixmap_size.width() + 400, pixmap_size.height() + 400)
+        .context("failed to create pixmap")?;
+    pixmap.fill({
+        let hex = bg.trim_start_matches('#');
+        (|| -> Option<_> {
+            let r: u8 = u8::from_str_radix(hex.get(0..2)?, 16).ok()?;
+            let g: u8 = u8::from_str_radix(hex.get(2..4)?, 16).ok()?;
+            let b: u8 = u8::from_str_radix(hex.get(4..6)?, 16).ok()?;
+            let a: u8 = u8::from_str_radix(hex.get(6..8).unwrap_or("ff"), 16).ok()?;
+            Some(Color::from_rgba8(r, g, b, a))
+        })()
+        .unwrap_or(Color::TRANSPARENT)
+    });
+
+    resvg::render(
+        &rtree,
+        usvg::FitTo::Size(pixmap_size.width(), pixmap_size.height()),
+        tiny_skia::Transform::from_translate(200.0, 200.0),
+        pixmap.as_mut(),
+    )
+    .context("failed to render")?;
+
+    let encoder = webp::Encoder::from_rgba(pixmap.data(), pixmap.width(), pixmap.height());
+    let encoded = encoder.encode_lossless();
+    let mut b64 = base64::encode(&*encoded);
+    b64.insert_str(0, "data:image/webp;base64,");
+    Ok(ImageSet {
+        svg: None,
+        webp: Some(b64),
+    })
+}
+
+async fn get_image_set(
+    latex: Option<&str>,
+    fg: &str,
+    bg: &str,
+) -> anyhow::Result<Option<ImageSet>> {
+    Ok(if let Some(latex) = latex {
+        let cleaned = latex.replace('…', r#"\ldots "#).replace('π', r#"\pi "#);
+        // Some(tokio::task::spawn_blocking(move || get_image_set_sync(&cleaned)).await??)
+        Some(get_image_set_sync(&cleaned, fg, bg)?)
     } else {
-        Ok(None)
-    }
+        None
+    })
 }
 
 async fn handler(
@@ -253,17 +321,20 @@ async fn handler(
             return Ok(Json(data.clone()));
         }
     }
-
+    tracing::info!("cache miss");
     let token = get_cached_token(&state).await?;
+    let fg = payload.foreground.clone().unwrap_or("#000000ff".to_owned());
+    let bg = payload.background.clone().unwrap_or("#00000000".to_owned());
     let symbolab = get_symbolab(&state, &token, &payload).await?;
     let queries_handle = {
-        let client = state.client.clone();
         let canonical_notebook_query = symbolab.canonical_notebook_query.clone();
         let standard_query = symbolab.standard_query.clone();
+        let fg = fg.clone();
+        let bg = bg.clone();
         tokio::spawn(async move {
             tokio::try_join!(
-                get_svg(&client, canonical_notebook_query.as_deref()),
-                get_svg(&client, standard_query.as_deref())
+                get_image_set(canonical_notebook_query.as_deref(), &fg, &bg),
+                get_image_set(standard_query.as_deref(), &fg, &bg)
             )
         })
     };
@@ -272,13 +343,14 @@ async fn handler(
         .iter()
         .flatten()
         .map(|solution| {
-            let client = state.client.clone();
             let step_input = solution.step_input.clone();
             let entire_result = solution.entire_result.clone();
+            let fg = fg.clone();
+            let bg = bg.clone();
             tokio::spawn(async move {
                 let (step_input, entire_result) = tokio::try_join!(
-                    get_svg(&client, step_input.as_deref()),
-                    get_svg(&client, entire_result.as_deref())
+                    get_image_set(step_input.as_deref(), &fg, &bg),
+                    get_image_set(entire_result.as_deref(), &fg, &bg)
                 )?;
                 Ok::<_, anyhow::Error>(Solution {
                     step_input,
@@ -295,23 +367,6 @@ async fn handler(
 
     let (canonical_notebook_query, standard_query) =
         queries_handle.await.context("failed to fetch queries")??;
-    // let (canonical_notebook_query, standard_query) = {
-    //     let canonical_notebook_query = {
-    //         let client = state.client.clone();
-    //         let q = symbolab.canonical_notebook_query.as_deref();
-    //         tokio::spawn(async move { get_svg(&client, q).await })
-    //     };
-    //     let standard_query = {
-    //         let client = state.client.clone();
-    //         let q = symbolab.standard_query.as_deref();
-    //         tokio::spawn(async move { get_svg(&client, q).await })
-    //     };
-
-    //     tokio::join!(canonical_notebook_query, standard_query)
-    // };
-    // let canonical_notebook_query =
-    //     (|| -> anyhow::Result<Option<String>> { Ok(canonical_notebook_query??) })()?;
-    // let standard_query = (|| -> anyhow::Result<Option<String>> { Ok(standard_query??) })()?;
 
     let data = Data {
         symbolab,

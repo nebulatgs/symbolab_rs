@@ -11,6 +11,13 @@ processes = []
 allowed_public_ports = []
 auto_rollback = true
 
+[deploy]
+strategy = "bluegreen"
+
+# [guest]
+# cpus = 8
+# memory_mb = 2048
+
 [[services]]
 http_checks = []
 internal_port = 8080
@@ -18,7 +25,7 @@ processes = ["app"]
 protocol = "tcp"
 script_checks = []
 [services.concurrency]
-hard_limit = 25
+hard_limit = 16384
 soft_limit = 20
 type = "connections"
 
