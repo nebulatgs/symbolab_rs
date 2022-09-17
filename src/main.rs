@@ -303,7 +303,27 @@ async fn get_image_set(
     bg: &str,
 ) -> anyhow::Result<Option<ImageSet>> {
     Ok(if let Some(latex) = latex {
-        let cleaned = latex.replace('…', r#"\ldots "#).replace('π', r#"\pi "#);
+        let cleaned = latex
+            .replace('…', r#"\ldots "#)
+            .replace('π', r#"\pi "#)
+            .replace('∞', r#"\infty "#)
+            .replace('∫', r#"\int "#)
+            .replace('∑', r#"\sum "#)
+            .replace('√', r#"\sqrt "#)
+            .replace('∂', r#"\partial "#)
+            .replace('∇', r#"\nabla "#)
+            .replace('∀', r#"\forall "#)
+            .replace('∃', r#"\exists "#)
+            .replace('∈', r#"\in "#)
+            .replace('∉', r#"\notin "#)
+            .replace('∋', r#"\ni "#)
+            .replace('∌', r#"\notni "#)
+            .replace('∏', r#"\prod "#)
+            .replace('∐', r#"\coprod "#)
+            .replace('∓', r#"\mp "#)
+            .replace('∔', r#"\dotplus "#)
+            .replace('∘', r#"\circ "#)
+            .replace('∝', r#"\propto "#);
         // Some(tokio::task::spawn_blocking(move || get_image_set_sync(&cleaned)).await??)
         Some(get_image_set_sync(&cleaned, fg, bg)?)
     } else {
